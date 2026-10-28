@@ -1,6 +1,7 @@
-#### Set MOD_FOLDER below, then run this script in Blender.
-#### Created by jinshi_lover | # Version 1.0
-
+####  Set MOD_FOLDER below, then run this script in Blender.
+####  Created by jinshi_lover | # Version 1.1
+####  PATREON: https://www.patreon.com/jinshi_lover
+####  GITHUB: https://github.com/game-model-importer/wuwa-mods-blender-importer
 from __future__ import annotations
 
 import argparse
@@ -12,10 +13,14 @@ import itertools
 import logging
 from pathlib import Path
 import re
+import colorsys
 import math
+import os
+import operator
 import struct
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -31,10 +36,79 @@ FLIP_UV_V = True
 STRICT_TEXTURES = False
 DECAL_INK_COLOR = (0.008, 0.008, 0.008, 1.0)  # Optional mark color.
 
+
+def worker_count():
+
+    available = getattr(os, 'process_cpu_count', os.cpu_count)() or 1
+    if hasattr(os, 'sched_getaffinity'):
+        available = min(available, len(os.sched_getaffinity(0)))
+    elif sys.platform == 'win32':
+        import ctypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel.GetProcessAffinityMask.argtypes = [ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+        process_mask, system_mask = ctypes.c_size_t(), ctypes.c_size_t()
+        if kernel.GetProcessAffinityMask(kernel.GetCurrentProcess(),
+                                        ctypes.byref(process_mask), ctypes.byref(system_mask)):
+            available = min(available, process_mask.value.bit_count())
+    return max(1, available // 2)
+
+
+def file_sha256(file):
+
+
+    if sys.platform == 'win32':
+        import ctypes
+        api = ctypes.WinDLL('bcrypt')
+        ptr, ulong, handle = ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p
+        signatures = {
+            'BCryptOpenAlgorithmProvider': [ctypes.POINTER(handle), ctypes.c_wchar_p, ctypes.c_wchar_p, ulong],
+            'BCryptCreateHash': [handle, ctypes.POINTER(handle), ptr, ulong, ptr, ulong, ulong],
+            'BCryptHashData': [handle, ptr, ulong, ulong],
+            'BCryptFinishHash': [handle, ptr, ulong, ulong],
+            'BCryptDestroyHash': [handle],
+            'BCryptCloseAlgorithmProvider': [handle, ulong],
+        }
+        for name, args in signatures.items():
+            function = getattr(api, name)
+            function.argtypes, function.restype = args, ctypes.c_long
+        algorithm, digest = handle(), handle()
+        start = file.tell()
+        try:
+            def check(status):
+                if status < 0:
+                    raise OSError('Windows SHA-256 failed: ' + hex(status & 0xffffffff))
+            check(api.BCryptOpenAlgorithmProvider(ctypes.byref(algorithm), 'SHA256', None, 0))
+            check(api.BCryptCreateHash(algorithm, ctypes.byref(digest), None, 0, None, 0, 0))
+            buffer = ctypes.create_string_buffer(1024 * 1024)
+            while count := file.readinto(buffer):
+                check(api.BCryptHashData(digest, buffer, count, 0))
+            output = ctypes.create_string_buffer(32)
+            check(api.BCryptFinishHash(digest, output, 32, 0))
+            return output.raw.hex()
+        except OSError:
+            file.seek(start)
+        finally:
+            if digest:
+                api.BCryptDestroyHash(digest)
+            if algorithm:
+                api.BCryptCloseAlgorithmProvider(algorithm, 0)
+    digest = hashlib.sha256()
+    buffer = bytearray(1024 * 1024)
+    view = memoryview(buffer)
+    while count := file.readinto(buffer):
+        digest.update(view[:count])
+    return digest.hexdigest()
+
+
+RABBITFX_NOTE = 'Toggle the RabbitFX Effects collection to enable or disable glow.'
+
 RABBITFX_DEFAULTS = dict(h=0., s=0., v=0., brightness=1., interpolate=1.)
 
 
 def numeric_value(expression, variables, parameters):
+
     values = {k.lower(): v for k, v in variables.items()}
     values.update({'\\rabbitfx\\' + k: v for k, v in parameters.items()})
     def replace(match):
@@ -62,6 +136,7 @@ def numeric_value(expression, variables, parameters):
 
 
 def capture_rabbitfx(state, command, line):
+
     if command == 'commandlist\\rabbitfx\\clear':
         state['fx_parameters'] = dict(RABBITFX_DEFAULTS)
         state['rabbitfx'] = {}
@@ -84,6 +159,18 @@ def capture_rabbitfx(state, command, line):
     aliases['resource\\rabbitfx\\glowmap'] = 'null'
     aliases['resource\\rabbitfx\\fxmap'] = 'null'
     return True
+
+
+def adjusted_color(rgb, settings):
+
+    h, s, v = colorsys.rgb_to_hsv(*rgb)
+    i = settings.get('interpolate', 1.)
+    h = (h + settings.get('h', 0.) / 360. * i) % 1.
+    s = max(0., s + settings.get('s', 0.) / 100. * i)
+    v = max(0., v + settings.get('v', 0.) / 100. * i)
+
+    return tuple(v * (1 + s * (min(1., max(0., abs(((h + offset) % 1.) * 6 - 3) - 1)) - 1))
+                 for offset in (0., 2/3, 1/3))
 
 
 RABBITFX_RUNTIME_SOURCE = r'''
@@ -177,6 +264,7 @@ def _rabbitfx_controller(importer):
 
 
 def rabbit_fx_effects(importer, material, draw):
+
     settings = draw.rabbitfx
     if not settings:
         return None
@@ -321,9 +409,11 @@ def rabbit_fx_effects(importer, material, draw):
     outer.active = active_node
     material['rabbitfx_applied'] = True
     material['rabbitfx_source'] = 'RabbitFX WW v8.3.2: CommandListRun and glow/HSV/cutout shader replacement'
-    material['rabbitfx_note'] = 'Toggle the RabbitFX Effects collection to enable or disable glow.'
+    material['rabbitfx_note'] = RABBITFX_NOTE
     return node
 
+
+WUWA_APPEARANCE_NOTE = 'Toggle WuWa Appearance for optional stylized lighting; use Scene Lights/World in Material Preview.'
 
 WUWA_RUNTIME_SOURCE = r'''
 import bpy
@@ -495,7 +585,7 @@ def _wuwa_controller(importer):
         collection.id_properties_ui(key).update(min=0., max=5.)
     for key in ('key_color', 'ambient_color', 'ambient_tint', 'shadow_tint'):
         collection.id_properties_ui(key).update(subtype='COLOR', min=0., max=1.)
-    collection['wuwa_note'] = 'Toggle WuWa Appearance for optional stylized lighting; use Scene Lights/World in Material Preview.'
+    collection['wuwa_note'] = WUWA_APPEARANCE_NOTE
     runtime = importer.track('texts', bpy.data.texts.new('WuWa Appearance Controls.py'))
     runtime.write(WUWA_RUNTIME_SOURCE)
     runtime.use_module = True
@@ -506,6 +596,7 @@ def _wuwa_controller(importer):
 
 
 def wuwa_appearance(importer, material):
+
     if material.get('wuwa_applied'):
         return material.node_tree.nodes['WuWa Appearance']
     bpy = importer.bpy
@@ -633,11 +724,18 @@ def wuwa_appearance(importer, material):
             variable.targets[0].data_path = '["' + key + '"]' + (f'[{index}]' if index is not None else '')
     outer.active = active
     material['wuwa_applied'] = True
-    material['wuwa_note'] = 'Toggle WuWa Appearance for optional stylized lighting; use Scene Lights/World in Material Preview.'
+    material['wuwa_note'] = WUWA_APPEARANCE_NOTE
     return node
 
 
-LOG = logging.getLogger("wwmi_import_v015")
+def rabbitfx_api():
+
+    return {"DEFAULTS": RABBITFX_DEFAULTS, "numeric_value": numeric_value,
+            "capture_rabbitfx": capture_rabbitfx, "adjusted_color": adjusted_color,
+            "rabbit_fx_effects": rabbit_fx_effects}
+
+
+LOG = logging.getLogger("wwmi_import_v11")
 
 
 CONTROLS_SOURCE = r'''
@@ -646,7 +744,7 @@ import json
 
 def find_root(obj):
     while obj is not None:
-        if obj.get("wwmi_import_version") == "0.15":
+        if obj.get("wwmi_import_version") == "1.1":
             return obj
         obj = obj.parent
     return None
@@ -691,8 +789,8 @@ def apply_state(root, changes):
     root["wwmi_toggle_values"] = json.dumps(settings)
     return settings
 
-class WWMI_OT_set_toggle_v015(bpy.types.Operator):
-    bl_idname = "wwmi.set_toggle_v015"
+class WWMI_OT_set_toggle_v11(bpy.types.Operator):
+    bl_idname = "wwmi.set_toggle_v11"
     bl_label = "Set model toggle"
     bl_options = {'REGISTER', 'UNDO'}
     root_name: bpy.props.StringProperty()
@@ -711,9 +809,9 @@ class WWMI_OT_set_toggle_v015(bpy.types.Operator):
             return {'CANCELLED'}
         return {'FINISHED'}
 
-class WWMI_PT_toggles_v015(bpy.types.Panel):
+class WWMI_PT_toggles_v11(bpy.types.Panel):
     bl_label = "Model Toggles"
-    bl_idname = "WWMI_PT_toggles_v015"
+    bl_idname = "WWMI_PT_toggles_v11"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "WWMI"
@@ -729,7 +827,7 @@ class WWMI_PT_toggles_v015(bpy.types.Panel):
             row = self.layout.row(align=True)
             row.label(text=key.replace('_', ' ').title())
             for value in values:
-                op = row.operator("wwmi.set_toggle_v015", text=str(value), depress=settings[key] == value)
+                op = row.operator("wwmi.set_toggle_v11", text=str(value), depress=settings[key] == value)
                 op.root_name = root.name
                 op.toggle = key
                 op.value_json = json.dumps(value)
@@ -749,7 +847,7 @@ class WWMI_PT_toggles_v015(bpy.types.Panel):
                                    ('key_strength', 'Light intensity'), ('ambient_color', 'Ambient color')):
                     box.prop(appearance, '["' + key + '"]', text=label)
 
-for cls in (WWMI_OT_set_toggle_v015, WWMI_PT_toggles_v015):
+for cls in (WWMI_OT_set_toggle_v11, WWMI_PT_toggles_v11):
     previous = getattr(bpy.types, cls.__name__, None)
     if previous is not None:
         bpy.utils.unregister_class(previous)
@@ -761,6 +859,31 @@ for cls in (WWMI_OT_set_toggle_v015, WWMI_PT_toggles_v015):
 class Line:
     number: int
     text: str
+    key: str = field(init=False, repr=False, compare=False)
+    value: str = field(init=False, repr=False, compare=False)
+    value_lower: str = field(init=False, repr=False, compare=False)
+    operands: tuple = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        key, separator, value = self.text.partition('=')
+        object.__setattr__(self, 'key', key.strip().lower() if separator else '')
+        object.__setattr__(self, 'value', value.strip())
+        object.__setattr__(self, 'value_lower', value.strip().lower())
+        key, value = self.key, self.value_lower
+        target = re.sub(r'^(?:ref|copy)\s+', '', value)
+        slot = re.fullmatch(r'ps-t(\d+)', key)
+        source_slot = re.fullmatch(r'ps-t(\d+)', target)
+        buffer = bool(re.fullmatch(r'ib|vb\d+', key))
+        resource = key.startswith('resource') and bool(re.fullmatch(r'resource[^ ]+|null', target))
+        checked = re.fullmatch(r'ps-t(\d+)', value) if key == 'checktextureoverride' else None
+        numbers = re.fullmatch(r'(\d+)\s*,\s*(\d+)\s*,\s*(-?\d+)', self.value) if key == 'drawindexed' else None
+        label = re.match(r';\s*Draw\s+(.+)', self.text, re.I) if self.text.startswith(';') else None
+        object.__setattr__(self, 'operands', (
+            int(slot[1]) if slot else None, target,
+            int(source_slot[1]) if source_slot else None, buffer, resource,
+            int(checked[1]) if checked else None,
+            tuple(map(int, numbers.groups())) if numbers else None,
+            label[1].strip() if label else None))
 
 
 @dataclass
@@ -802,6 +925,7 @@ class Draw:
 
 
 def discover_ini(path):
+
     path = Path(path).expanduser().resolve()
     if path.is_file():
         if path.suffix.lower() != ".ini":
@@ -827,6 +951,7 @@ def discover_ini(path):
 
 
 def named_texture_role(binding):
+
     leaf = binding.lower().rsplit("\\", 1)[-1].removeprefix("resource")
     return {"diffuse": "base_color", "albedo": "base_color", "basecolor": "base_color",
             "base_color": "base_color", "normalmap": "normal", "normal": "normal",
@@ -835,6 +960,7 @@ def named_texture_role(binding):
 
 
 def read_ini(path, _seen=None):
+
     path = Path(path).resolve()
     seen = set() if _seen is None else _seen
     if path in seen:
@@ -877,21 +1003,41 @@ def read_ini(path, _seen=None):
     return sections
 
 
+class Condition(str):
+
+
+    def __new__(cls, expression):
+        result = super().__new__(cls, expression)
+        low = expression.strip().lower()
+        result.simple = None
+        match = re.fullmatch(r'\$([a-z_]\w*)\s*(===|!==|==|!=|<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)', low)
+        if match:
+            key, operation, literal = match.groups()
+            value = float(literal) if '.' in literal else int(literal)
+            function = {'==': operator.eq, '===': operator.eq, '!=': operator.ne,
+                        '!==': operator.ne, '<': operator.lt, '<=': operator.le,
+                        '>': operator.gt, '>=': operator.ge}[operation]
+            result.simple = key, function, value
+        result.variables = tuple(re.findall(r'\$([a-z_]\w*)', low))
+        return result
+
+
 def control_tree(lines):
+
     root, block, stack = [], None, []
     block = root
     for line in lines:
         low = line.text.lower()
         if low.startswith("if "):
             arm = []
-            branch = Branch([(line.text[3:].strip(), arm)])
+            branch = Branch([(Condition(line.text[3:].strip()), arm)])
             block.append(branch)
             stack.append((block, branch))
             block = arm
         elif low.startswith("else if ") or low.startswith("elif ") or low == "else":
             if not stack or stack[-1][1].arms[-1][0] is None:
                 raise ValueError(f"Line {line.number}: misplaced {line.text}")
-            expression = None if low == "else" else line.text[8 if low.startswith('else if ') else 5:].strip()
+            expression = None if low == "else" else Condition(line.text[8 if low.startswith('else if ') else 5:].strip())
             block = []
             stack[-1][1].arms.append((expression, block))
         elif low == "endif":
@@ -906,6 +1052,12 @@ def control_tree(lines):
 
 
 def condition_value(expression, variables, resources=None):
+
+    if isinstance(expression, Condition) and expression.simple is not None:
+        key, compare, value = expression.simple
+        if key not in variables:
+            raise ValueError(f"Unknown condition variable ${key}: {expression.strip().lower()}")
+        return compare(variables[key], value)
     expression = expression.strip().lower()
 
 
@@ -964,13 +1116,12 @@ def condition_value(expression, variables, resources=None):
 
 
 def dds_info(path):
+
     with Path(path).open("rb") as file:
         header = file.read(148)
         file.seek(0)
-        digest = hashlib.sha256()
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    info = {"digest": digest.hexdigest(), "width": 0, "height": 0, "srgb": None}
+        digest = file_sha256(file)
+    info = {"digest": digest, "width": 0, "height": 0, "srgb": None}
     if header[:4] != b"DDS " or len(header) < 128:
         return info
     info["height"], info["width"] = struct.unpack_from("<II", header, 12)
@@ -983,11 +1134,16 @@ def dds_info(path):
 
 
 class TextureResolver:
+
+
     SLOT_ROLES = {0: "normal", 1: "mask", 2: "base_color", 3: "secondary_color", 17: "effect"}
 
     def __init__(self, model):
         self.model = model
         self.info, self.roles, self.evidence = {}, {}, {}
+        paths = {}
+        self._memberships = {}
+        self._profile_indices = {id(draw): index for index, draw in enumerate(model.draws)}
         for resource, data in model.resources.items():
             if "filename" not in data:
                 continue
@@ -996,7 +1152,19 @@ class TextureResolver:
                 continue
             if not path.is_file():
                 raise FileNotFoundError(path)
-            self.info[resource] = dds_info(path)
+            paths[resource] = path
+
+
+        unique_paths = list(dict.fromkeys(paths.values()))
+        workers = min(worker_count(), len(unique_paths))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='WWMI') as pool:
+                metadata = dict(zip(unique_paths, pool.map(dds_info, unique_paths)))
+        else:
+            metadata = {path: dds_info(path) for path in unique_paths}
+        for resource, path in paths.items():
+
+            self.info[resource] = dict(metadata[path])
             self.roles[resource] = set()
             self.evidence[resource] = []
         for draw in model.draws:
@@ -1048,9 +1216,11 @@ class TextureResolver:
         self.profiles = [self.resolve(draw) for draw in model.draws]
 
     def membership(self, resource):
-        name = self.model.resource_path(resource).name
-        match = re.match(r"components?-([0-9]+(?:-[0-9]+)*)(?=\s|\.|$)", name, re.I)
-        return tuple(map(int, match[1].split("-"))) if match else ()
+        if resource not in self._memberships:
+            name = self.model.resource_path(resource).name
+            match = re.match(r"components?-([0-9]+(?:-[0-9]+)*)(?=\s|\.|$)", name, re.I)
+            self._memberships[resource] = tuple(map(int, match[1].split("-"))) if match else ()
+        return self._memberships[resource]
 
     def resolve(self, draw):
         resources = list(dict.fromkeys([*draw.slots.values(),
@@ -1153,10 +1323,11 @@ class TextureResolver:
                 "rabbitfx": draw.rabbitfx}
 
     def profile(self, draw):
-        return self.profiles[self.model.draws.index(draw)]
+        return self.profiles[self._profile_indices[id(draw)]]
 
     def report(self):
         referenced = {r for p in self.profiles for r in p["resources"]}
+        resource_paths = {self.model.resource_path(r).resolve() for r in self.info}
         return {"ini": str(self.model.ini_path), "toggles": self.model.variables,
                 "toggle_options": self.model.toggle_options,
                 "invalid_alternate_states": self.model.variant_errors,
@@ -1166,7 +1337,7 @@ class TextureResolver:
                               for r, info in self.info.items()},
                 "resources_without_draws": sorted(set(self.info) - referenced),
                 "unreferenced_texture_files": sorted(str(p) for p in self.model.folder.rglob("*.dds")
-                    if p.resolve() not in {self.model.resource_path(r).resolve() for r in self.info}),
+                    if p.resolve() not in resource_paths),
                 "limitation": "Assignments marked inference are not verified original shader bindings. Packed masks/effects retain source data; their game shading is not reconstructed."}
 
 
@@ -1193,6 +1364,16 @@ class Model:
         self.arrays = {}
         self.shape_keys = {}
         self._trees = {}
+        self._resource_paths = {}
+        self._texture_sections = [section for section in self.sections.values()
+                                  if section.name.lower().startswith("textureoverride") and any(
+                                      re.match(r"this\s*=", line.text, re.I) for line in section.lines)]
+        self._texture_variables = tuple(sorted({key.lower() for section in self._texture_sections
+                                                for line in section.lines
+                                                for key in re.findall(r"\$([a-z_]\w*)", line.text, re.I)}))
+        self._texture_candidates_cache = {}
+        self._component_sections = [(int(match[1]), section) for section in self.sections.values()
+                                    if (match := re.fullmatch(r"textureoverridecomponent(\d+)", section.name, re.I))]
         self.parse_variants()
         if not self.draws:
             raise ValueError("No mesh draws found")
@@ -1201,6 +1382,7 @@ class Model:
         self.texture_resolver = TextureResolver(self)
 
     def toggle_domains(self):
+
         domains = {}
         number = r"-?\d+(?:\.\d+)?"
         for section in self.sections.values():
@@ -1228,9 +1410,11 @@ class Model:
         return (draw.component, draw.start, draw.count, draw.base_vertex,
                 tuple(sorted(draw.buffers.items())), tuple(sorted(draw.slots.items())),
                 tuple(sorted((k, v["role"], v["resource"]) for k, v in draw.named_bindings.items())),
-                draw.candidates, json.dumps(draw.rabbitfx, sort_keys=True))
+                draw.candidates, tuple(sorted(draw.rabbitfx.items())))
 
     def parse_variants(self):
+
+
         defaults = dict(self.variables)
         include_disabled = self.include_disabled
         domains = self.toggle_domains()
@@ -1264,6 +1448,7 @@ class Model:
                     message = str(exc)
                     self.variant_errors.setdefault(message, {"count": 0, "example": settings})["count"] += 1
                     continue
+                state_signatures = set()
                 for draw in self.draws:
                     signature = self.draw_signature(draw)
                     if signature not in variants:
@@ -1272,8 +1457,9 @@ class Model:
                         changes = {k: v for k, v in settings.items() if v != defaults[k]}
                         draw.variant_label = ", ".join(f"{k}={v}" for k, v in changes.items())
                         variants[signature] = draw
-                    if settings not in variants[signature].toggle_states:
+                    if signature not in state_signatures:
                         variants[signature].toggle_states.append(settings)
+                        state_signatures.add(signature)
         finally:
             self.variables = defaults
             self.include_disabled = include_disabled
@@ -1290,6 +1476,8 @@ class Model:
         return self._trees[key]
 
     def draw_dependencies(self, domains):
+
+
         result = {}
         def variables(text):
             return set(re.findall(r"\$([a-z_]\w*)", text.lower())) & domains.keys()
@@ -1387,6 +1575,8 @@ class Model:
             self.warnings.add(f"Skipped {detail['count']} invalid local toggle states: {message}")
 
     def source_buffer(self, resource, slot):
+
+
         expected = {"ib": "R32_UINT", "vb0": "R32G32B32_FLOAT", "vb1": "R8G8B8A8_SNORM",
                     "vb2": "R16G16_FLOAT", "vb3": "R8G8B8A8_UNORM", "vb4": "R8_UINT"}
         if slot not in expected:
@@ -1423,20 +1613,26 @@ class Model:
         return typed[0]
 
     def resource_path(self, resource):
-        info = self.resources.get(resource.lower())
+        resource = resource.lower()
+        if resource in self._resource_paths:
+            return self._resource_paths[resource]
+        info = self.resources.get(resource)
         if info is None or "filename" not in info:
             raise ValueError(f"Missing file resource: {resource}")
-        section = self.sections.get(resource.lower())
+        section = self.sections.get(resource)
         directory = section.source.parent if section and section.source else self.folder
-        return directory / info["filename"].strip('"').replace("\\", "/")
+        path = directory / info["filename"].strip('"').replace("\\", "/")
+        self._resource_paths[resource] = path
+        return path
 
     def texture_candidates(self, component):
 
 
-        result = []
-
-
         variables = dict(self.variables, object_detected=1, mod_enabled=1)
+        cache_key = tuple((key, variables.get(key)) for key in self._texture_variables)
+        if cache_key in self._texture_candidates_cache:
+            return self._texture_candidates_cache[cache_key].get(component, ())
+        result = {}
 
         def selected_lines(nodes):
             for node in nodes:
@@ -1448,39 +1644,39 @@ class Model:
                 else:
                     yield node
 
-        for section in self.sections.values():
-            if not section.name.lower().startswith("textureoverride"):
-                continue
+        for section in self._texture_sections:
 
 
-            if not any(re.match(r"this\s*=", line.text, re.I) for line in section.lines):
-                continue
             resource = ""
             for line in selected_lines(self.tree(section)):
-                match = re.match(r"this\s*=\s*(.+)", line.text, re.I)
-                if match:
-                    resource = match[1].lower()
+                if line.key == 'this' and line.value:
+                    resource = line.value_lower
             resource = re.sub(r"^(?:ref|copy)\s+", "", resource)
             if resource and resource != "null" and resource not in self.resources:
                 raise ValueError(f"[{section.name}]: selected texture resource is not defined: {resource}")
             info = self.resources.get(resource, {})
             name = Path(info.get("filename", "").replace("\\", "/")).name
             match = re.match(r"components?-([0-9]+(?:-[0-9]+)*)(?=\s|\.|$)", name, re.I)
-            if match and component in map(int, match[1].split("-")):
-                result.append(resource)
+            if match:
+                for member in set(map(int, match[1].split("-"))):
+                    result.setdefault(member, []).append(resource)
 
 
-        return tuple(reversed(dict.fromkeys(reversed(result))))
+        candidates = {member: tuple(reversed(dict.fromkeys(reversed(resources))))
+                      for member, resources in result.items()}
+        if len(self._texture_candidates_cache) >= 256:
+            self._texture_candidates_cache.clear()
+        self._texture_candidates_cache[cache_key] = candidates
+        return candidates.get(component, ())
 
     def parse_draws(self, only_component=None, only_lines=None):
         runtime_lists = {"commandlistmergeskeleton",
                          "commandlistcleanupsharedresources"}
+        user_variables = self.variables.keys() - {
+            "mod_enabled", "state_id", "mod_id", "object_detected", "object_guid",
+            "mesh_vertex_count", "shapekey_vertex_count", "required_wwmi_version"}
 
-        for section in self.sections.values():
-            match = re.fullmatch(r"textureoverridecomponent(\d+)", section.name, re.I)
-            if not match:
-                continue
-            component = int(match[1])
+        for component, section in self._component_sections:
             if only_component is not None and component != only_component:
                 continue
             candidates = self.texture_candidates(component)
@@ -1491,13 +1687,10 @@ class Model:
                         chosen = False
                         selected_state = None
                         previous = []
-                        user_variables = set(self.variables) - {
-                            "mod_enabled", "state_id", "mod_id", "object_detected", "object_guid",
-                            "mesh_vertex_count", "shapekey_vertex_count", "required_wwmi_version"}
-                        is_toggle_branch = any(
-                            key.lower() in user_variables
+                        is_toggle_branch = self.include_disabled and any(
+                            key in user_variables
                             for expression, _ in node.arms if expression is not None
-                            for key in re.findall(r"\$([a-z_]\w*)", expression, re.I))
+                            for key in expression.variables)
                         for expression, body in node.arms:
                             def resource_present(name):
                                 target = state["aliases"].get(name, name)
@@ -1507,10 +1700,10 @@ class Model:
                                 expression, self.variables, resource_present))
                             chosen |= takes_arm
                             arm_condition = expression or "else: " + ", ".join(previous)
-                            branch_state = {k: (v.copy() if isinstance(v, (dict, set)) else v) for k, v in state.items()}
 
 
                             if takes_arm or (self.include_disabled and is_toggle_branch):
+                                branch_state = {k: (v.copy() if isinstance(v, (dict, set)) else v) for k, v in state.items()}
                                 walk(body, branch_state, active and takes_arm, conditions + (arm_condition,), chain)
                             if takes_arm:
                                 selected_state = branch_state
@@ -1520,41 +1713,37 @@ class Model:
                             state.update(selected_state)
                         continue
                     text = node.text
+                    slot, target, source_slot, buffer_slot, resource_binding, checked, numbers, label = node.operands
                     if text.startswith(";"):
-                        label = re.match(r";\s*Draw\s+(.+)", text, re.I)
-                        if label:
-                            state["label"] = label[1].strip()
+                        if label is not None:
+                            state["label"] = label
                         continue
                     if "=" not in text:
                         continue
-                    key, value = (s.strip() for s in text.split("=", 1))
-                    key, value_lower = key.lower(), value.lower()
-                    slot = re.fullmatch(r"ps-t(\d+)", key)
+                    key, value, value_lower = node.key, node.value, node.value_lower
                     if key.startswith("$\\rabbitfx\\"):
+                        api = rabbitfx_api()
                         parameter = key.rsplit("\\", 1)[-1]
-                        if parameter in RABBITFX_DEFAULTS:
-                            parameters = state.setdefault("fx_parameters", dict(RABBITFX_DEFAULTS))
-                            parameters[parameter] = numeric_value(value, self.variables, parameters)
+                        if parameter in api["DEFAULTS"]:
+                            parameters = state.setdefault("fx_parameters", dict(api["DEFAULTS"]))
+                            parameters[parameter] = api["numeric_value"](value, self.variables, parameters)
                         else:
                             self.warnings.add(f"Unsupported RabbitFX setting at line {node.number}: {key}")
-                    elif slot:
-                        value_lower = re.sub(r"^(?:ref|copy)\s+", "", value_lower)
-                        if re.fullmatch(r"ps-t\d+", value_lower):
-                            source_slot = int(value_lower[4:])
+                    elif slot is not None:
+                        value_lower = target
+                        if source_slot is not None:
                             if source_slot not in state["slots"]:
                                 raise ValueError(f"Line {node.number}: copy from unresolved slot {value_lower}")
                             value_lower = state["slots"][source_slot]
                         value_lower = state["aliases"].get(value_lower, value_lower)
                         if value_lower == "null":
-                            state["slots"].pop(int(slot[1]), None)
+                            state["slots"].pop(slot, None)
                         else:
-                            state["slots"][int(slot[1])] = value_lower
-                    elif re.fullmatch(r"ib|vb\d+", key):
-                        target = re.sub(r"^(?:ref|copy)\s+", "", value_lower)
+                            state["slots"][slot] = value_lower
+                    elif buffer_slot:
                         target = state["aliases"].get(target, target)
                         state["buffers"][key] = self.source_buffer(target, key)
-                    elif key.startswith("resource") and re.fullmatch(r"(?:ref\s+|copy\s+)?(?:resource[^ ]+|null)", value_lower):
-                        target = re.sub(r"^(?:ref|copy)\s+", "", value_lower)
+                    elif resource_binding:
                         state["aliases"][key] = state["aliases"].get(target, target)
                         role = named_texture_role(key)
                         if role:
@@ -1564,14 +1753,13 @@ class Model:
                                 state["named"][key] = {"role": role, "resource": state["aliases"][key],
                                                        "line": node.number}
                     elif key == "checktextureoverride":
-                        checked = re.fullmatch(r"ps-t(\d+)", value_lower)
-                        if checked:
-                            state["checked"].add(int(checked[1]))
+                        if checked is not None:
+                            state["checked"].add(checked)
                     elif key == "run":
                         if value_lower in {"commandlist\\rabbitfx\\run", "commandlist\\rabbitfx\\clear"}:
                             if "fx_parameters" not in state:
-                                state["fx_parameters"] = dict(RABBITFX_DEFAULTS)
-                            capture_rabbitfx(state, value_lower, node.number)
+                                state["fx_parameters"] = dict(rabbitfx_api()["DEFAULTS"])
+                            rabbitfx_api()["capture_rabbitfx"](state, value_lower, node.number)
                             continue
                         if value_lower in runtime_lists:
                             continue
@@ -1584,10 +1772,9 @@ class Model:
                             raise ValueError(f"Recursive command list: {value}")
                         walk(self.tree(self.sections[value_lower]), state, active, conditions, chain + (value_lower,))
                     elif key == "drawindexed":
-                        numbers = re.fullmatch(r"(\d+)\s*,\s*(\d+)\s*,\s*(-?\d+)", value)
-                        if not numbers:
+                        if numbers is None:
                             raise ValueError(f"Line {node.number}: unsupported drawindexed {value}")
-                        count, start, base = map(int, numbers.groups())
+                        count, start, base = numbers
                         if count and (active or self.include_disabled) and (only_lines is None or node.number in only_lines):
                             self.draws.append(Draw(component, state.get("label") or f"Component {component} Draw {len(self.draws)+1}",
                                                    count, start, base, node.number, active, conditions,
@@ -1670,11 +1857,13 @@ class Model:
             self.bone_ids = np.fromfile(path, "<u2").reshape(count, self.influences_per_vertex).astype(np.int32)
             self.warnings.add("Numeric vertex groups restored from the exported blend-remap vertex-VG buffer")
         self.load_shape_keys()
+        checked_resources = set()
         for draw in self.draws:
             for resource in (set(draw.slots.values()) | set(draw.candidates)
-                             | {e["resource"] for e in draw.named_bindings.values()}):
+                             | {e["resource"] for e in draw.named_bindings.values()}) - checked_resources:
                 if not self.resource_path(resource).is_file():
                     raise FileNotFoundError(self.resource_path(resource))
+                checked_resources.add(resource)
         if any(not d.slots and d.candidates for d in self.draws):
             self.warnings.add("Hash replacements are resolved through resource evidence and DDS metadata; inferred assignments are recorded in the texture report.")
         self.warnings.add("Skin weights use numeric merged bone IDs; the source contains no skeleton rest pose.")
@@ -1728,16 +1917,32 @@ class Model:
                 self.shape_keys[key] = (key_ids, deltas[start:end])
 
     def validate_draws(self):
+        checked = set()
         for draw in self.draws:
+            signature = self.geometry_signature(draw)
+            if signature in checked:
+                continue
             if draw.start < 0 or draw.count % 3 or draw.start + draw.count > len(self.indices):
                 raise ValueError(f"Line {draw.line} ({draw.name}): invalid triangle draw range")
             indices = self.indices[draw.start:draw.start+draw.count].astype(np.int64) + draw.base_vertex
             if np.any(indices < 0) or np.any(indices >= len(self.positions)):
                 raise ValueError(f"Line {draw.line} ({draw.name}): vertex index outside Position buffer")
+            checked.add(signature)
 
     def geometry(self, draw):
         indices = self.indices[draw.start:draw.start+draw.count].astype(np.int64) + draw.base_vertex
-        vertex_ids, remapped = np.unique(indices, return_inverse=True)
+
+
+        if len(indices) and (span := int(indices.max() - indices.min()) + 1) <= max(4096, len(indices) * 4):
+            first = int(indices.min())
+            offsets = indices - first
+            lookup = np.zeros(span, dtype=np.int32)
+            lookup[offsets] = 1
+            used = np.flatnonzero(lookup)
+            lookup[used] = np.arange(len(used), dtype=np.int32)
+            vertex_ids, remapped = used + first, lookup[offsets]
+        else:
+            vertex_ids, remapped = np.unique(indices, return_inverse=True)
         faces = remapped.reshape(-1, 3)
         if FLIP_WINDING:
             faces = faces[:, [0, 2, 1]]
@@ -1787,6 +1992,7 @@ class BlenderImporter:
         return self.images[key]
 
     def sample_rgba(self, resource, size=48):
+
         digest = self.model.texture_resolver.info[resource]["digest"]
         key = (digest, size)
         if key not in self.samples:
@@ -1807,6 +2013,8 @@ class BlenderImporter:
         return self.sample_rgba(resource, size)[:, :3]
 
     def prepare_texture_profiles(self):
+
+
         resolver = self.model.texture_resolver
         candidates = {r for p in resolver.profiles for r in p["resources"]
                       if p["assignments"].get("base_color", {}).get("method")
@@ -1837,6 +2045,7 @@ class BlenderImporter:
             self.refine_shared_normal_layout(profile)
 
     def layout_feature(self, resource, size, channels):
+
         digest = self.model.texture_resolver.info[resource]["digest"]
         key = (digest, size, channels)
         if key not in self.layout_features:
@@ -1854,6 +2063,8 @@ class BlenderImporter:
                 for size in (64, 128, 256)]
 
     def refine_shared_normal_layout(self, profile):
+
+
         resolver = self.model.texture_resolver
         assignments = profile["assignments"]
         normal = assignments.get("normal")
@@ -1932,6 +2143,8 @@ class BlenderImporter:
             profile["notes"].append("Color candidate resolved by matching texture-family image content (inference)")
 
     def refine_packed_decal(self, profile):
+
+
         base = profile["assignments"].get("base_color")
         if not base or base["method"] in {"explicit_binding", "named_resource_binding"}:
             return
@@ -2002,7 +2215,7 @@ class BlenderImporter:
             return self.materials[key]
         base = base_choice["resource"] if base_choice else None
         name = self.model.resource_path(base).stem if base else f"Component {draw.component} unresolved"
-        mat = self.track("materials", self.bpy.data.materials.new(f"{name} [v0.15]"))
+        mat = self.track("materials", self.bpy.data.materials.new(f"{name} [v1.1]"))
         mat.use_nodes = True
         nodes, links = mat.node_tree.nodes, mat.node_tree.links
         nodes.clear()
@@ -2123,29 +2336,50 @@ class BlenderImporter:
         blend = self.model.arrays["vb4"][vertex_ids]
 
 
-        pairs = {}
         influences = self.model.influences_per_vertex
         bone_ids = self.model.bone_ids[vertex_ids]
-        radix = int(self.model.bone_ids.max()) + 1
-        for column in range(influences):
-            good = blend[:, column + influences] > 0
-            local = np.flatnonzero(good)
-            encoded = local.astype(np.int64) * radix + bone_ids[good, column]
-            for code, weight in zip(encoded.tolist(), blend[good, column + influences].tolist()):
-                pairs[code] = pairs.get(code, 0) + weight
-        buckets = {}
-        for code, weight in pairs.items():
-            buckets.setdefault((code % radix, weight), []).append(code // radix)
-        groups = {bone: obj.vertex_groups.new(name=str(bone)) for bone in sorted({k[0] for k in buckets})}
-        for (bone, weight), vertices in buckets.items():
-            groups[bone].add(vertices, weight / 255.0, "REPLACE")
+        weights = blend[:, influences:]
+        local, columns = np.nonzero(weights)
+        if not len(local):
+            return
+        radix = int(bone_ids.max()) + 1
+        encoded = local.astype(np.int64) * radix + bone_ids[local, columns]
+        order = np.argsort(encoded, kind="stable")
+        encoded = encoded[order]
+        starts = np.r_[0, np.flatnonzero(np.diff(encoded)) + 1]
+        summed = np.add.reduceat(weights[local, columns][order].astype(np.int64), starts)
+        pairs = encoded[starts]
+
+        weight_radix = influences * 255 + 1
+        buckets = (pairs % radix) * weight_radix + summed
+        order = np.argsort(buckets, kind="stable")
+        buckets, vertices = buckets[order], (pairs // radix)[order]
+        starts = np.r_[0, np.flatnonzero(np.diff(buckets)) + 1]
+        ends = np.r_[starts[1:], len(buckets)]
+        groups = {int(bone): obj.vertex_groups.new(name=str(bone))
+                  for bone in np.unique(pairs % radix)}
+        for start, end in zip(starts, ends):
+            bone, weight = divmod(int(buckets[start]), weight_radix)
+            groups[bone].add(vertices[start:end].tolist(), weight / 255.0, "REPLACE")
 
     def shape_keys(self, obj, vertex_ids):
         basis = self.model.positions[vertex_ids]
+        lookup = None
+        if len(vertex_ids) and (span := int(vertex_ids[-1] - vertex_ids[0]) + 1) <= max(4096, len(vertex_ids) * 8):
+            first = int(vertex_ids[0])
+            lookup = np.full(span, -1, dtype=np.int32)
+            lookup[vertex_ids - first] = np.arange(len(vertex_ids), dtype=np.int32)
         for key_id, (source_ids, deltas) in self.model.shape_keys.items():
-            local = np.searchsorted(vertex_ids, source_ids)
-            good = local < len(vertex_ids)
-            good[good] &= vertex_ids[local[good]] == source_ids[good]
+            if lookup is None:
+                local = np.searchsorted(vertex_ids, source_ids)
+                good = local < len(vertex_ids)
+                good[good] &= vertex_ids[local[good]] == source_ids[good]
+            else:
+                offsets = source_ids.astype(np.int64) - first
+                good = (offsets >= 0) & (offsets < len(lookup))
+                local = np.full(len(source_ids), -1, dtype=np.int32)
+                local[good] = lookup[offsets[good]]
+                good &= local >= 0
             if not good.any():
                 continue
             if obj.data.shape_keys is None:
@@ -2163,8 +2397,6 @@ class BlenderImporter:
         name = draw.name
         mesh = self.track("meshes", bpy.data.meshes.new(name))
         obj = self.track("objects", bpy.data.objects.new(name, mesh))
-        collection.objects.link(obj)
-        obj.parent = parent
         mesh.vertices.add(len(vertex_ids))
         mesh.vertices.foreach_set("co", self.model.positions[vertex_ids].ravel())
         mesh.loops.add(faces.size)
@@ -2177,8 +2409,11 @@ class BlenderImporter:
         loop_ids = vertex_ids[faces.ravel()]
         for index, uv_data in enumerate(self.model.uvs):
             name = f"TEXCOORD{index or ''}.xy"
-            layer = mesh.uv_layers.new(name=name)
-            layer.data.foreach_set("uv", uv_data[loop_ids].ravel())
+            layer = mesh.uv_layers.new(name=name, do_init=False)
+            if hasattr(layer, 'uv'):
+                layer.uv.foreach_set("vector", uv_data[loop_ids].ravel())
+            else:
+                layer.data.foreach_set("uv", uv_data[loop_ids].ravel())
         mesh.uv_layers.active_index = 0
         mesh.uv_layers[0].active_render = True
         for name, data in (("COLOR", self.model.arrays["vb3"][loop_ids].astype(np.float32) / 255),
@@ -2209,6 +2444,10 @@ class BlenderImporter:
         obj["wwmi_conditions"] = json.dumps(draw.conditions)
         obj["wwmi_toggle_states"] = json.dumps(draw.toggle_states)
         obj["wwmi_default_visible"] = draw.active
+
+
+        collection.objects.link(obj)
+        obj.parent = parent
         obj.hide_render = not draw.active
         obj.hide_set(not draw.active)
         return obj
@@ -2224,7 +2463,7 @@ class BlenderImporter:
         bpy = self.bpy
         if bpy.app.version < (3, 6, 0):
             raise RuntimeError("Blender 3.6 or newer is required")
-        collection = self.track("collections", bpy.data.collections.new(f"{self.model.folder.name} [v0.15]"))
+        collection = self.track("collections", bpy.data.collections.new(f"{self.model.folder.name} [v1.1]"))
         bpy.context.scene.collection.children.link(collection)
         self.import_collection = collection
         try:
@@ -2232,7 +2471,7 @@ class BlenderImporter:
             root = self.track("objects", bpy.data.objects.new(self.model.folder.name, None))
             collection.objects.link(root)
             root.scale = (SCALE,) * 3
-            root["wwmi_import_version"] = "0.15"
+            root["wwmi_import_version"] = "1.1"
             root["wwmi_source"] = str(self.model.folder)
             root["wwmi_import_summary"] = json.dumps(self.model.summary())
             root["wwmi_toggle_options"] = json.dumps(self.model.toggle_options)
@@ -2246,7 +2485,7 @@ class BlenderImporter:
                 geometry = self.model.geometry_signature(draw)
                 groups.setdefault(geometry, []).append(draw)
                 for state in draw.toggle_states:
-                    states[json.dumps(state, sort_keys=True)] = state
+                    states[tuple(sorted(state.items()))] = state
             root["wwmi_valid_toggle_states"] = json.dumps(list(states.values()))
             for i, variants in enumerate(groups.values(), 1):
                 draw = next((d for d in variants if d.active), variants[0])
@@ -2264,14 +2503,14 @@ class BlenderImporter:
                     entries.append({"slot": slot, "states": variant.toggle_states,
                                     "ini_line": variant.line, "variant": variant.variant_label})
                     for state in variant.toggle_states:
-                        object_states[json.dumps(state, sort_keys=True)] = state
+                        object_states[tuple(sorted(state.items()))] = state
                 obj["wwmi_material_variants"] = json.dumps(entries)
                 obj["wwmi_toggle_states"] = json.dumps(list(object_states.values()))
             root["wwmi_mesh_count"] = len(groups)
-            controls = self.track("texts", bpy.data.texts.new("WWMI v0.15 Controls.py"))
+            controls = self.track("texts", bpy.data.texts.new("WWMI v1.1 Controls.py"))
             controls.write(CONTROLS_SOURCE)
             root["wwmi_controls_script"] = controls.name
-            self.controls = {"__name__": "wwmi_controls_v015"}
+            self.controls = {"__name__": "wwmi_controls_v11"}
             exec(compile(CONTROLS_SOURCE, controls.name, "exec", dont_inherit=True), self.controls)
             self.controls["apply_state"](root, {})
             if hasattr(self, "wuwa_collection"):
@@ -2286,7 +2525,7 @@ class BlenderImporter:
                 root["wwmi_rabbitfx_controls"] = self.rabbitfx_collection["rabbitfx_controls_script"]
                 self.rabbitfx_runtime["rabbitfx_sync"]()
 
-            report = self.track("texts", bpy.data.texts.new("WWMI v0.15 Texture Resolution.json"))
+            report = self.track("texts", bpy.data.texts.new("WWMI v1.1 Texture Resolution.json"))
             report.write(json.dumps(self.model.texture_resolver.report(), indent=2))
             root["wwmi_texture_report"] = report.name
             bpy.context.view_layer.update()
@@ -2298,7 +2537,7 @@ class BlenderImporter:
 
 def main(argv=None):
     global STRICT_TEXTURES
-    parser = argparse.ArgumentParser(description="WWMI model importer v0.15")
+    parser = argparse.ArgumentParser(description="WuWa Mod Importer 1.1")
     parser.add_argument("--mod-folder", type=Path, default=MOD_FOLDER,
                         help="Mod directory (searched recursively) or an explicit INI file")
     parser.add_argument("--validate", action="store_true", help="Check all source data without creating Blender objects")
