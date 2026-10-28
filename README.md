@@ -1,3 +1,7 @@
+<a href="https://www.patreon.com/cw/jinshi_lover">
+  <img src="https://raw.githubusercontent.com/game-model-importer/wuwa-mods-blender-importer/main/patreon-button.png" alt="Support me on Patreon" width="150">
+</a>
+
 # WuWa Mod Importer
 
 Import Wuthering Waves WWMI mods into Blender from their INI files, mesh buffers, and textures.
