@@ -1,6 +1,6 @@
 ####  Set MOD_FOLDER below, then run this script in Blender.
 ####  Created by jinshi_lover | # Version 1.1
-####  PATREON: https://www.patreon.com/jinshi_lover 
+####  PATREON: https://www.patreon.com/jinshi_lover
 ####  GITHUB: https://github.com/game-model-importer/wuwa-mods-blender-importer
 
 
